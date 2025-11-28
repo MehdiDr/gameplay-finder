@@ -303,6 +303,7 @@ def index_videos(cfg: Config, progress_cb=None) -> None:
                     "rel_video_path": str(vpath.relative_to(source_dir)),
                     "timestamp_sec": float(timestamp),
                     "frame_index": int(frame_index),
+                    "fps": float(fps),
                 })
 
                 global_frame_counter += 1

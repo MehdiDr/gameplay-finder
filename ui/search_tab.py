@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QApplication,
     QMessageBox,
+    QSlider,
 )
 
 from config import Config, seconds_to_timecode
@@ -46,6 +47,7 @@ from resolve_bridge import write_resolve_bridge_command
 from utils_resolve import is_resolve_running
 from .ui_helpers import create_card, option_label, info_label, section_title
 from .workers import SearchWorker
+
 
 class SearchTab(QWidget):
     """
@@ -71,7 +73,7 @@ class SearchTab(QWidget):
         self.preview_cache: dict[tuple[str, int], QPixmap] = {}
         self.preview_cache_max_size: int = 32
 
-        # Widgets
+        # Widgets principaux
         self.query_edit: QLineEdit | None = None
         self.search_button: QPushButton | None = None
         self.topk_spin: QSpinBox | None = None
@@ -87,6 +89,19 @@ class SearchTab(QWidget):
         self.preview_container: QWidget | None = None
         self.preview_anim: QPropertyAnimation | None = None
         self.preview_expanded_width: int = 440
+
+        # Mini-timeline
+        self.timeline_slider: QSlider | None = None
+        self.timeline_info_label: QLabel | None = None
+        self.timeline_range_spin: QSpinBox | None = None
+
+        self._timeline_current_row: Optional[int] = None
+        self._timeline_center_frame_index: Optional[int] = None
+        self._timeline_center_timestamp: float = 0.0
+        self._timeline_fps: Optional[float] = None
+        self._timeline_video_path: Optional[str] = None
+        self._timeline_offset: int = 0     # offset en frames par rapport à la frame centrale
+        self._timeline_range: int = 30     # +/- 30 frames par défaut
 
         self._build_ui()
 
@@ -215,7 +230,7 @@ class SearchTab(QWidget):
         splitter.addWidget(left_widget)
         splitter.setStretchFactor(0, 3)
 
-        # Panneau droit : preview + infos
+        # Panneau droit : preview + mini-timeline + infos
         right_widget = QWidget()
         self.preview_container = right_widget
         self.preview_container.setMaximumWidth(self.preview_expanded_width)
@@ -233,6 +248,39 @@ class SearchTab(QWidget):
         self.preview_label.setMinimumSize(QSize(380, 220))
         self.preview_label.setObjectName("PreviewLabel")
         right_layout.addWidget(self.preview_label, stretch=1)
+
+        # Mini-timeline (slider + range + label)
+        timeline_row = QVBoxLayout()
+        timeline_row.setSpacing(4)
+
+        # Ligne slider + réglage de la plage
+        timeline_controls = QHBoxLayout()
+        timeline_controls.setSpacing(8)
+
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
+        self.timeline_slider.setValue(0)
+        self.timeline_slider.setEnabled(False)
+        self.timeline_slider.valueChanged.connect(self.on_timeline_slider_changed)
+        timeline_controls.addWidget(self.timeline_slider, stretch=1)
+
+        lbl_range = option_label("Plage (frames ±)")
+        timeline_controls.addWidget(lbl_range)
+
+        self.timeline_range_spin = QSpinBox()
+        self.timeline_range_spin.setRange(5, 200)      # <= tu peux monter jusqu'à ±200
+        self.timeline_range_spin.setValue(self._timeline_range)
+        self.timeline_range_spin.setFixedWidth(70)
+        self.timeline_range_spin.valueChanged.connect(self.on_timeline_range_changed)
+        timeline_controls.addWidget(self.timeline_range_spin)
+
+        timeline_row.addLayout(timeline_controls)
+
+        self.timeline_info_label = info_label("Mini-timeline : frame centrale", parent=self)
+        self.timeline_info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        timeline_row.addWidget(self.timeline_info_label)
+
+        right_layout.addLayout(timeline_row)
 
         self.info_label = info_label("")
         self.info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -278,6 +326,24 @@ class SearchTab(QWidget):
 
     # ========= interne =========
 
+    def _reset_timeline(self) -> None:
+        self._timeline_current_row = None
+        self._timeline_center_frame_index = None
+        self._timeline_center_timestamp = 0.0
+        self._timeline_fps = None
+        self._timeline_video_path = None
+        self._timeline_offset = 0
+
+        if self.timeline_slider is not None:
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setEnabled(False)
+            self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
+            self.timeline_slider.setValue(0)
+            self.timeline_slider.blockSignals(False)
+
+        if self.timeline_info_label is not None:
+            self.timeline_info_label.setText("Mini-timeline : frame centrale")
+
     def _reset_results_view(self) -> None:
         if self.results_list is not None:
             self.results_list.clear()
@@ -287,6 +353,7 @@ class SearchTab(QWidget):
         if self.info_label is not None:
             self.info_label.setText("")
         self.preview_pixmap = None
+        self._reset_timeline()
 
     @Slot(int)
     def _on_project_changed_from_search(self, index: int) -> None:
@@ -424,24 +491,60 @@ class SearchTab(QWidget):
 
     # ========= Résultats & preview =========
 
+    def _update_info_label(self, result: SearchResult, timestamp_sec: float, frame_index: Optional[int]) -> None:
+        if self.info_label is None:
+            return
+
+        meta = result.meta
+        path = meta.get("video_path", "unknown")
+        tc = seconds_to_timecode(float(timestamp_sec))
+
+        extra = ""
+        if frame_index is not None:
+            extra = f"   |   Frame : {frame_index}"
+
+        self.info_label.setText(
+            f"{path}\nTimecode : {tc}   |   Score : {result.score:.3f}{extra}"
+        )
+
     @Slot(int)
     def on_result_selected(self, row: int) -> None:
         if row < 0 or row >= len(self.current_results):
+            self._reset_timeline()
             return
 
         result = self.current_results[row]
         meta = result.meta
 
         path = meta.get("video_path", "unknown")
-        ts = meta.get("timestamp_sec", meta.get("timestamp", 0.0))
-        tc = seconds_to_timecode(float(ts))
+        ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
         frame_index = meta.get("frame_index", None)
+        fps = meta.get("fps", None)
 
+        # On met à jour la mini-timeline
+        self._timeline_current_row = row
+        self._timeline_center_frame_index = int(frame_index) if frame_index is not None else None
+        self._timeline_center_timestamp = ts
+        self._timeline_video_path = path
+        self._timeline_offset = 0
+        self._timeline_fps = float(fps) if fps is not None else None
+
+        if self.timeline_slider is not None:
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
+            self.timeline_slider.setValue(0)
+            self.timeline_slider.setEnabled(True if self._timeline_center_frame_index is not None else False)
+            self.timeline_slider.blockSignals(False)
+
+        if self.timeline_info_label is not None:
+            self.timeline_info_label.setText("Mini-timeline : frame centrale (∆ = 0)")
+
+        # Preview
         if self.autopreview_check.isChecked():
             self.load_preview_frame(path, frame_index)
 
-        info = f"{path}\nTimecode : {tc}   |   Score : {result.score:.3f}"
-        self.info_label.setText(info)
+        # Infos
+        self._update_info_label(result, ts, frame_index)
 
     def load_preview_frame(self, video_path: str, frame_index: int | None) -> None:
         self.preview_pixmap = None
@@ -507,7 +610,8 @@ class SearchTab(QWidget):
         self.animate_preview(enabled)
 
         if not enabled:
-            self.preview_label.clear()
+            if self.preview_label is not None:
+                self.preview_label.clear()
             self.preview_pixmap = None
         else:
             row = self.results_list.currentRow()
@@ -518,6 +622,86 @@ class SearchTab(QWidget):
                 frame_index = meta.get("frame_index", None)
                 self.load_preview_frame(path, frame_index)
 
+    # ========= Mini-timeline =========
+
+    @Slot(int)
+    def on_timeline_range_changed(self, value: int) -> None:
+        """
+        Modifie la plage de la mini-timeline (±value frames).
+        Met à jour la range du slider et recale la valeur courante si besoin.
+        """
+        self._timeline_range = max(1, int(value))
+
+        if self.timeline_slider is None:
+            return
+
+        cur_val = self.timeline_slider.value()
+
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
+
+        # on garde l'offset actuel dans la nouvelle plage, si possible
+        if cur_val < -self._timeline_range:
+            cur_val = -self._timeline_range
+        if cur_val > self._timeline_range:
+            cur_val = self._timeline_range
+
+        self.timeline_slider.setValue(cur_val)
+        self.timeline_slider.blockSignals(False)
+
+        # On force un refresh de la frame si on a déjà un résultat sélectionné
+        if (
+            self._timeline_current_row is not None
+            and 0 <= self._timeline_current_row < len(self.current_results)
+            and self._timeline_center_frame_index is not None
+            and self._timeline_video_path is not None
+        ):
+            self.on_timeline_slider_changed(cur_val)
+
+    @Slot(int)
+    def on_timeline_slider_changed(self, value: int) -> None:
+        """
+        value : offset en frames par rapport à la frame centrale.
+        """
+        self._timeline_offset = value
+
+        if self._timeline_current_row is None:
+            return
+        if self._timeline_center_frame_index is None:
+            return
+        if self._timeline_video_path is None:
+            return
+        if not (0 <= self._timeline_current_row < len(self.current_results)):
+            return
+
+        base_idx = self._timeline_center_frame_index
+        new_index = base_idx + value
+        if new_index < 0:
+            new_index = 0
+
+        # Calcul du timestamp ajusté si on a un fps
+        result = self.current_results[self._timeline_current_row]
+        meta = result.meta
+        base_ts = self._timeline_center_timestamp
+        fps = self._timeline_fps
+        if fps is not None and fps > 0:
+            new_ts = max(0.0, base_ts + float(value) / fps)
+        else:
+            new_ts = base_ts  # fallback : on garde le timecode central
+
+        # Preview
+        self.load_preview_frame(self._timeline_video_path, new_index)
+
+        # Infos
+        self._update_info_label(result, new_ts, new_index)
+
+        # Label de la mini-timeline
+        if self.timeline_info_label is not None:
+            self.timeline_info_label.setText(
+                f"Mini-timeline : ∆ frames = {value} (fps={fps:.2f})" if fps else
+                f"Mini-timeline : ∆ frames = {value}"
+            )
+
     # ========= Utilitaires =========
 
     def get_current_result(self) -> Optional[SearchResult]:
@@ -525,6 +709,35 @@ class SearchTab(QWidget):
         if row < 0 or row >= len(self.current_results):
             return None
         return self.current_results[row]
+
+    def _get_effective_timestamp_and_frame(self, result: SearchResult) -> tuple[float, Optional[int]]:
+        """
+        Retourne (timestamp_sec, frame_index) en tenant compte de la mini-timeline
+        si elle est active sur le résultat courant.
+        """
+        meta = result.meta
+        base_ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+        base_frame = meta.get("frame_index", None)
+
+        # Si pas de mini-timeline active pour cette ligne -> valeurs de base
+        row = self.results_list.currentRow() if self.results_list is not None else -1
+        if (
+            row != self._timeline_current_row
+            or self._timeline_center_frame_index is None
+            or base_frame is None
+        ):
+            return base_ts, base_frame
+
+        # Mini-timeline active, on utilise offset
+        fps = self._timeline_fps
+        offset = self._timeline_offset
+        if fps is not None and fps > 0:
+            ts = max(0.0, self._timeline_center_timestamp + float(offset) / fps)
+        else:
+            ts = base_ts
+
+        frame_idx = max(0, self._timeline_center_frame_index + offset)
+        return ts, frame_idx
 
     @Slot()
     def on_copy_clicked(self) -> None:
@@ -534,7 +747,8 @@ class SearchTab(QWidget):
 
         meta = result.meta
         path = meta.get("video_path", "unknown")
-        ts = meta.get("timestamp_sec", meta.get("timestamp", 0.0))
+
+        ts, _ = self._get_effective_timestamp_and_frame(result)
         tc = seconds_to_timecode(float(ts))
 
         line = f"{path} @ {tc}"
@@ -551,11 +765,12 @@ class SearchTab(QWidget):
 
         meta = result.meta
         path = meta.get("video_path", "unknown")
-        ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
 
         if not Path(path).is_file():
             self.status_message.emit("Fichier vidéo introuvable.", 3000)
             return
+
+        ts, _ = self._get_effective_timestamp_and_frame(result)
 
         vlc_path = Path(self.cfg.VLC_PATH)
         if not vlc_path.is_file():
@@ -603,7 +818,9 @@ class SearchTab(QWidget):
 
         meta = getattr(result, "meta", None) or {}
         video_path = meta.get("video_path") or meta.get("path")
-        timestamp_sec = meta.get("timestamp_sec") or meta.get("timestamp") or 0.0
+
+        ts, _ = self._get_effective_timestamp_and_frame(result)
+        timestamp_sec = float(ts)
 
         if not video_path:
             QMessageBox.warning(
@@ -612,11 +829,6 @@ class SearchTab(QWidget):
                 "Impossible de récupérer le chemin de la vidéo pour ce résultat.",
             )
             return
-
-        try:
-            timestamp_sec = float(timestamp_sec)
-        except Exception:
-            timestamp_sec = 0.0
 
         write_resolve_bridge_command(video_path, timestamp_sec)
 
