@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 import cv2
 from cv2 import cvtColor, COLOR_BGR2RGB
@@ -19,7 +19,6 @@ from PySide6.QtCore import (
     Signal,
     Slot,
     QThread,
-    QObject,
 )
 from PySide6.QtGui import QPixmap, QImage, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -30,15 +29,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QListWidget,
-    QListWidgetItem,
     QCheckBox,
     QSpinBox,
     QSplitter,
     QComboBox,
     QApplication,
     QMessageBox,
-    QSlider,
 )
 
 from config import Config, seconds_to_timecode
@@ -47,11 +43,13 @@ from resolve_bridge import write_resolve_bridge_command
 from utils_resolve import is_resolve_running
 from .ui_helpers import create_card, option_label, info_label, section_title
 from .workers import SearchWorker
+from .results_panel import ResultsPanel
+from .timeline_widget import TimelineWidget
 
 
 class SearchTab(QWidget):
     """
-    Onglet Recherche : texte -> résultats -> preview + actions (VLC / Resolve).
+    Onglet Recherche : texte -> résultats -> preview + mini-timeline + actions (VLC / Resolve).
     """
     status_message = Signal(str, int)
     project_selected = Signal(str)       # émis quand on change de projet depuis l'onglet recherche
@@ -70,38 +68,31 @@ class SearchTab(QWidget):
         self._last_query: str = ""
 
         # Cache de preview : (video_path, frame_index) -> QPixmap
-        self.preview_cache: dict[tuple[str, int], QPixmap] = {}
+        self.preview_cache: Dict[Tuple[str, int], QPixmap] = {}
         self.preview_cache_max_size: int = 32
+
+        # Cache FPS pour éviter de rouvrir sans cesse les vidéos
+        self._fps_cache: Dict[str, float] = {}
+
+        # Timestamp courant par ligne (pour coller à la mini-timeline)
+        self._current_ts_for_row: Dict[int, float] = {}
 
         # Widgets principaux
         self.query_edit: QLineEdit | None = None
         self.search_button: QPushButton | None = None
         self.topk_spin: QSpinBox | None = None
         self.autopreview_check: QCheckBox | None = None
-        self.results_list: QListWidget | None = None
-        self.copy_button: QPushButton | None = None
-        self.vlc_button: QPushButton | None = None
-        self.resolve_button: QPushButton | None = None
+        self.project_combo: QComboBox | None = None
+
         self.preview_label: QLabel | None = None
         self.info_label: QLabel | None = None
-        self.project_combo: QComboBox | None = None
 
         self.preview_container: QWidget | None = None
         self.preview_anim: QPropertyAnimation | None = None
         self.preview_expanded_width: int = 440
 
-        # Mini-timeline
-        self.timeline_slider: QSlider | None = None
-        self.timeline_info_label: QLabel | None = None
-        self.timeline_range_spin: QSpinBox | None = None
-
-        self._timeline_current_row: Optional[int] = None
-        self._timeline_center_frame_index: Optional[int] = None
-        self._timeline_center_timestamp: float = 0.0
-        self._timeline_fps: Optional[float] = None
-        self._timeline_video_path: Optional[str] = None
-        self._timeline_offset: int = 0     # offset en frames par rapport à la frame centrale
-        self._timeline_range: int = 30     # +/- 30 frames par défaut
+        self.results_panel: ResultsPanel | None = None
+        self.timeline_widget: TimelineWidget | None = None
 
         self._build_ui()
 
@@ -197,40 +188,11 @@ class SearchTab(QWidget):
         main_card_layout.addWidget(splitter, stretch=1)
 
         # Panneau gauche : résultats
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
-
-        self.results_list = QListWidget()
-        self.results_list.setObjectName("ResultsList")
-        self.results_list.setFont(QFont("Consolas", 9))
-        self.results_list.currentRowChanged.connect(self.on_result_selected)
-        self.results_list.itemDoubleClicked.connect(self.on_copy_clicked)
-        left_layout.addWidget(self.results_list, stretch=1)
-
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(8)
-        left_layout.addLayout(buttons_row)
-
-        self.copy_button = QPushButton("Copier chemin + timecode")
-        self.copy_button.clicked.connect(self.on_copy_clicked)
-        buttons_row.addWidget(self.copy_button)
-
-        self.vlc_button = QPushButton("Ouvrir dans VLC")
-        self.vlc_button.clicked.connect(self.on_open_vlc_clicked)
-        buttons_row.addWidget(self.vlc_button)
-
-        self.resolve_button = QPushButton("Ouvrir dans Resolve")
-        self.resolve_button.clicked.connect(self.on_open_in_resolve_clicked)
-        buttons_row.addWidget(self.resolve_button)
-
-        buttons_row.addStretch()
-
-        splitter.addWidget(left_widget)
+        self.results_panel = ResultsPanel(self)
+        splitter.addWidget(self.results_panel)
         splitter.setStretchFactor(0, 3)
 
-        # Panneau droit : preview + mini-timeline + infos
+        # Panneau droit : preview + infos + mini-timeline
         right_widget = QWidget()
         self.preview_container = right_widget
         self.preview_container.setMaximumWidth(self.preview_expanded_width)
@@ -249,43 +211,14 @@ class SearchTab(QWidget):
         self.preview_label.setObjectName("PreviewLabel")
         right_layout.addWidget(self.preview_label, stretch=1)
 
-        # Mini-timeline (slider + range + label)
-        timeline_row = QVBoxLayout()
-        timeline_row.setSpacing(4)
-
-        # Ligne slider + réglage de la plage
-        timeline_controls = QHBoxLayout()
-        timeline_controls.setSpacing(8)
-
-        self.timeline_slider = QSlider(Qt.Horizontal)
-        self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
-        self.timeline_slider.setValue(0)
-        self.timeline_slider.setEnabled(False)
-        self.timeline_slider.valueChanged.connect(self.on_timeline_slider_changed)
-        timeline_controls.addWidget(self.timeline_slider, stretch=1)
-
-        lbl_range = option_label("Plage (frames ±)")
-        timeline_controls.addWidget(lbl_range)
-
-        self.timeline_range_spin = QSpinBox()
-        self.timeline_range_spin.setRange(5, 200)      # <= tu peux monter jusqu'à ±200
-        self.timeline_range_spin.setValue(self._timeline_range)
-        self.timeline_range_spin.setFixedWidth(70)
-        self.timeline_range_spin.valueChanged.connect(self.on_timeline_range_changed)
-        timeline_controls.addWidget(self.timeline_range_spin)
-
-        timeline_row.addLayout(timeline_controls)
-
-        self.timeline_info_label = info_label("Mini-timeline : frame centrale", parent=self)
-        self.timeline_info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        timeline_row.addWidget(self.timeline_info_label)
-
-        right_layout.addLayout(timeline_row)
-
         self.info_label = info_label("")
         self.info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.info_label.setWordWrap(True)
         right_layout.addWidget(self.info_label)
+
+        # Mini-timeline
+        self.timeline_widget = TimelineWidget(self)
+        right_layout.addWidget(self.timeline_widget)
 
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(1, 2)
@@ -295,6 +228,14 @@ class SearchTab(QWidget):
         # --- Raccourcis clavier globaux pour l'onglet ---
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self.on_copy_clicked)
         QShortcut(QKeySequence("E"), self, activated=self.on_open_vlc_clicked)
+
+        # Connexions internes
+        self.results_panel.row_selected.connect(self.on_result_selected_row)
+        self.results_panel.copy_requested.connect(self._on_copy_requested_from_panel)
+        self.results_panel.open_vlc_requested.connect(self._on_open_vlc_requested_from_panel)
+        self.results_panel.open_resolve_requested.connect(self._on_open_resolve_requested_from_panel)
+
+        self.timeline_widget.frame_changed.connect(self.on_timeline_frame_changed)
 
         # État initial du panneau de preview
         if self.autopreview_check is not None:
@@ -326,34 +267,46 @@ class SearchTab(QWidget):
 
     # ========= interne =========
 
-    def _reset_timeline(self) -> None:
-        self._timeline_current_row = None
-        self._timeline_center_frame_index = None
-        self._timeline_center_timestamp = 0.0
-        self._timeline_fps = None
-        self._timeline_video_path = None
-        self._timeline_offset = 0
-
-        if self.timeline_slider is not None:
-            self.timeline_slider.blockSignals(True)
-            self.timeline_slider.setEnabled(False)
-            self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
-            self.timeline_slider.setValue(0)
-            self.timeline_slider.blockSignals(False)
-
-        if self.timeline_info_label is not None:
-            self.timeline_info_label.setText("Mini-timeline : frame centrale")
-
     def _reset_results_view(self) -> None:
-        if self.results_list is not None:
-            self.results_list.clear()
+        if self.results_panel is not None:
+            self.results_panel.clear()
         self.current_results = []
+        self._current_ts_for_row = {}
         if self.preview_label is not None:
             self.preview_label.clear()
         if self.info_label is not None:
             self.info_label.setText("")
         self.preview_pixmap = None
-        self._reset_timeline()
+
+    def _get_video_fps(self, path: str) -> float:
+        if not path:
+            return 0.0
+        if path in self._fps_cache:
+            return self._fps_cache[path]
+        if not Path(path).is_file():
+            self._fps_cache[path] = 0.0
+            return 0.0
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            self._fps_cache[path] = 0.0
+            return 0.0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        if fps <= 0:
+            fps = 0.0
+        self._fps_cache[path] = fps
+        return fps
+
+    def get_current_row(self) -> int:
+        if self.results_panel is None:
+            return -1
+        return self.results_panel.current_row()
+
+    def get_current_result(self) -> Optional[SearchResult]:
+        row = self.get_current_row()
+        if row < 0 or row >= len(self.current_results):
+            return None
+        return self.current_results[row]
 
     @Slot(int)
     def _on_project_changed_from_search(self, index: int) -> None:
@@ -442,27 +395,35 @@ class SearchTab(QWidget):
         results : list[SearchResult]
         """
         self.current_results = []
-        if self.results_list is not None:
-            self.results_list.clear()
+        self._current_ts_for_row = {}
 
-        for result in results:
-            meta = result.meta
+        if self.results_panel is not None:
+            self.results_panel.clear()
+
+        lines: List[str] = []
+        tooltips: List[str] = []
+
+        for idx, result in enumerate(results):
+            meta = result.meta or {}
             path = meta.get("video_path", "unknown")
             rel = meta.get("rel_video_path", Path(path).name)
 
-            ts = meta.get("timestamp_sec", meta.get("timestamp", 0.0))
-            tc = seconds_to_timecode(float(ts))
+            ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+            tc = seconds_to_timecode(ts)
 
             display_path = rel
             if len(display_path) > 70:
                 display_path = "…" + display_path[-67:]
 
             line = f"{tc:>8}   {result.score:5.3f}   {display_path}"
-            item = QListWidgetItem(line)
-            item.setToolTip(path)
-            self.results_list.addItem(item)
+            lines.append(line)
+            tooltips.append(path)
 
             self.current_results.append(result)
+            self._current_ts_for_row[idx] = ts
+
+        if self.results_panel is not None:
+            self.results_panel.set_items(lines, tooltips)
 
         if not self.current_results:
             self.status_message.emit(f"Aucun résultat pour « {self._last_query} ».", 3000)
@@ -472,8 +433,9 @@ class SearchTab(QWidget):
                 f"{len(self.current_results)} résultats.",
                 2500,
             )
-            self.results_list.setCurrentRow(0)
-            self.results_list.setFocus()
+            if self.results_panel is not None:
+                self.results_panel.set_current_row(0)
+                self.results_panel.focus_list()
 
     @Slot(str)
     def _on_search_error(self, message: str) -> None:
@@ -491,60 +453,35 @@ class SearchTab(QWidget):
 
     # ========= Résultats & preview =========
 
-    def _update_info_label(self, result: SearchResult, timestamp_sec: float, frame_index: Optional[int]) -> None:
-        if self.info_label is None:
-            return
-
-        meta = result.meta
-        path = meta.get("video_path", "unknown")
-        tc = seconds_to_timecode(float(timestamp_sec))
-
-        extra = ""
-        if frame_index is not None:
-            extra = f"   |   Frame : {frame_index}"
-
-        self.info_label.setText(
-            f"{path}\nTimecode : {tc}   |   Score : {result.score:.3f}{extra}"
-        )
-
     @Slot(int)
-    def on_result_selected(self, row: int) -> None:
+    def on_result_selected_row(self, row: int) -> None:
         if row < 0 or row >= len(self.current_results):
-            self._reset_timeline()
             return
 
         result = self.current_results[row]
-        meta = result.meta
+        meta = result.meta or {}
 
         path = meta.get("video_path", "unknown")
         ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+        tc = seconds_to_timecode(ts)
         frame_index = meta.get("frame_index", None)
-        fps = meta.get("fps", None)
 
-        # On met à jour la mini-timeline
-        self._timeline_current_row = row
-        self._timeline_center_frame_index = int(frame_index) if frame_index is not None else None
-        self._timeline_center_timestamp = ts
-        self._timeline_video_path = path
-        self._timeline_offset = 0
-        self._timeline_fps = float(fps) if fps is not None else None
+        # FPS pour la mini-timeline
+        fps = self._get_video_fps(path)
+        if self.timeline_widget is not None:
+            self.timeline_widget.set_context(
+                video_path=path,
+                fps=fps,
+                center_frame=int(frame_index) if frame_index is not None else 0,
+                center_ts=ts,
+                interval_sec=self.cfg.INTERVAL_SEC,
+            )
 
-        if self.timeline_slider is not None:
-            self.timeline_slider.blockSignals(True)
-            self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
-            self.timeline_slider.setValue(0)
-            self.timeline_slider.setEnabled(True if self._timeline_center_frame_index is not None else False)
-            self.timeline_slider.blockSignals(False)
-
-        if self.timeline_info_label is not None:
-            self.timeline_info_label.setText("Mini-timeline : frame centrale (∆ = 0)")
-
-        # Preview
         if self.autopreview_check.isChecked():
             self.load_preview_frame(path, frame_index)
 
-        # Infos
-        self._update_info_label(result, ts, frame_index)
+        info = f"{path}\nTimecode : {tc}   |   Score : {result.score:.3f}"
+        self.info_label.setText(info)
 
     def load_preview_frame(self, video_path: str, frame_index: int | None) -> None:
         self.preview_pixmap = None
@@ -610,146 +547,58 @@ class SearchTab(QWidget):
         self.animate_preview(enabled)
 
         if not enabled:
-            if self.preview_label is not None:
-                self.preview_label.clear()
+            self.preview_label.clear()
             self.preview_pixmap = None
         else:
-            row = self.results_list.currentRow()
+            row = self.get_current_row()
             if 0 <= row < len(self.current_results):
                 result = self.current_results[row]
-                meta = result.meta
+                meta = result.meta or {}
                 path = meta.get("video_path", "unknown")
                 frame_index = meta.get("frame_index", None)
                 self.load_preview_frame(path, frame_index)
 
     # ========= Mini-timeline =========
 
-    @Slot(int)
-    def on_timeline_range_changed(self, value: int) -> None:
+    @Slot(int, float)
+    def on_timeline_frame_changed(self, frame_index: int, ts: float) -> None:
         """
-        Modifie la plage de la mini-timeline (±value frames).
-        Met à jour la range du slider et recale la valeur courante si besoin.
+        Appelé quand l'utilisateur bouge le slider de mini-timeline.
+        On met à jour la preview + le timecode courant pour la ligne sélectionnée.
         """
-        self._timeline_range = max(1, int(value))
-
-        if self.timeline_slider is None:
+        row = self.get_current_row()
+        if row < 0 or row >= len(self.current_results):
             return
 
-        cur_val = self.timeline_slider.value()
-
-        self.timeline_slider.blockSignals(True)
-        self.timeline_slider.setRange(-self._timeline_range, self._timeline_range)
-
-        # on garde l'offset actuel dans la nouvelle plage, si possible
-        if cur_val < -self._timeline_range:
-            cur_val = -self._timeline_range
-        if cur_val > self._timeline_range:
-            cur_val = self._timeline_range
-
-        self.timeline_slider.setValue(cur_val)
-        self.timeline_slider.blockSignals(False)
-
-        # On force un refresh de la frame si on a déjà un résultat sélectionné
-        if (
-            self._timeline_current_row is not None
-            and 0 <= self._timeline_current_row < len(self.current_results)
-            and self._timeline_center_frame_index is not None
-            and self._timeline_video_path is not None
-        ):
-            self.on_timeline_slider_changed(cur_val)
-
-    @Slot(int)
-    def on_timeline_slider_changed(self, value: int) -> None:
-        """
-        value : offset en frames par rapport à la frame centrale.
-        """
-        self._timeline_offset = value
-
-        if self._timeline_current_row is None:
-            return
-        if self._timeline_center_frame_index is None:
-            return
-        if self._timeline_video_path is None:
-            return
-        if not (0 <= self._timeline_current_row < len(self.current_results)):
+        result = self.current_results[row]
+        meta = result.meta or {}
+        path = meta.get("video_path", "unknown")
+        if not path:
             return
 
-        base_idx = self._timeline_center_frame_index
-        new_index = base_idx + value
-        if new_index < 0:
-            new_index = 0
-
-        # Calcul du timestamp ajusté si on a un fps
-        result = self.current_results[self._timeline_current_row]
-        meta = result.meta
-        base_ts = self._timeline_center_timestamp
-        fps = self._timeline_fps
-        if fps is not None and fps > 0:
-            new_ts = max(0.0, base_ts + float(value) / fps)
-        else:
-            new_ts = base_ts  # fallback : on garde le timecode central
+        self._current_ts_for_row[row] = ts
 
         # Preview
-        self.load_preview_frame(self._timeline_video_path, new_index)
+        self.load_preview_frame(path, frame_index)
 
-        # Infos
-        self._update_info_label(result, new_ts, new_index)
-
-        # Label de la mini-timeline
-        if self.timeline_info_label is not None:
-            self.timeline_info_label.setText(
-                f"Mini-timeline : ∆ frames = {value} (fps={fps:.2f})" if fps else
-                f"Mini-timeline : ∆ frames = {value}"
-            )
+        tc = seconds_to_timecode(ts)
+        info = f"{path}\nTimecode : {tc}   |   Score : {result.score:.3f}"
+        self.info_label.setText(info)
 
     # ========= Utilitaires =========
 
-    def get_current_result(self) -> Optional[SearchResult]:
-        row = self.results_list.currentRow()
-        if row < 0 or row >= len(self.current_results):
-            return None
-        return self.current_results[row]
-
-    def _get_effective_timestamp_and_frame(self, result: SearchResult) -> tuple[float, Optional[int]]:
-        """
-        Retourne (timestamp_sec, frame_index) en tenant compte de la mini-timeline
-        si elle est active sur le résultat courant.
-        """
-        meta = result.meta
-        base_ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
-        base_frame = meta.get("frame_index", None)
-
-        # Si pas de mini-timeline active pour cette ligne -> valeurs de base
-        row = self.results_list.currentRow() if self.results_list is not None else -1
-        if (
-            row != self._timeline_current_row
-            or self._timeline_center_frame_index is None
-            or base_frame is None
-        ):
-            return base_ts, base_frame
-
-        # Mini-timeline active, on utilise offset
-        fps = self._timeline_fps
-        offset = self._timeline_offset
-        if fps is not None and fps > 0:
-            ts = max(0.0, self._timeline_center_timestamp + float(offset) / fps)
-        else:
-            ts = base_ts
-
-        frame_idx = max(0, self._timeline_center_frame_index + offset)
-        return ts, frame_idx
-
     @Slot()
     def on_copy_clicked(self) -> None:
-        result = self.get_current_result()
-        if result is None:
+        row = self.get_current_row()
+        if row < 0 or row >= len(self.current_results):
             return
 
-        meta = result.meta
+        result = self.current_results[row]
+        meta = result.meta or {}
         path = meta.get("video_path", "unknown")
-
-        ts, _ = self._get_effective_timestamp_and_frame(result)
-        tc = seconds_to_timecode(float(ts))
+        base_ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+        ts = self._current_ts_for_row.get(row, base_ts)
+        tc = seconds_to_timecode(ts)
 
         line = f"{path} @ {tc}"
         QApplication.clipboard().setText(line)
@@ -759,18 +608,19 @@ class SearchTab(QWidget):
 
     @Slot()
     def on_open_vlc_clicked(self) -> None:
-        result = self.get_current_result()
-        if result is None:
+        row = self.get_current_row()
+        if row < 0 or row >= len(self.current_results):
             return
 
-        meta = result.meta
+        result = self.current_results[row]
+        meta = result.meta or {}
         path = meta.get("video_path", "unknown")
+        base_ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+        ts = float(self._current_ts_for_row.get(row, base_ts))
 
         if not Path(path).is_file():
             self.status_message.emit("Fichier vidéo introuvable.", 3000)
             return
-
-        ts, _ = self._get_effective_timestamp_and_frame(result)
 
         vlc_path = Path(self.cfg.VLC_PATH)
         if not vlc_path.is_file():
@@ -798,8 +648,8 @@ class SearchTab(QWidget):
         Slot appelé quand on clique sur le bouton 'Ouvrir dans Resolve'.
         Récupère le SearchResult sélectionné et envoie la commande à Resolve.
         """
-        result = self.get_current_result()
-        if result is None:
+        row = self.get_current_row()
+        if row < 0 or row >= len(self.current_results):
             QMessageBox.warning(
                 self,
                 "Aucun résultat",
@@ -816,11 +666,11 @@ class SearchTab(QWidget):
             )
             return
 
+        result = self.current_results[row]
         meta = getattr(result, "meta", None) or {}
         video_path = meta.get("video_path") or meta.get("path")
-
-        ts, _ = self._get_effective_timestamp_and_frame(result)
-        timestamp_sec = float(ts)
+        base_ts = float(meta.get("timestamp_sec", meta.get("timestamp", 0.0)))
+        timestamp_sec = float(self._current_ts_for_row.get(row, base_ts))
 
         if not video_path:
             QMessageBox.warning(
@@ -836,3 +686,23 @@ class SearchTab(QWidget):
             "Commande envoyée à DaVinci Resolve (insertion dans la timeline courante).",
             3000,
         )
+
+    # ========= Callbacks depuis le panneau de résultats =========
+
+    @Slot(int)
+    def _on_copy_requested_from_panel(self, row: int) -> None:
+        if self.results_panel is not None:
+            self.results_panel.set_current_row(row)
+        self.on_copy_clicked()
+
+    @Slot(int)
+    def _on_open_vlc_requested_from_panel(self, row: int) -> None:
+        if self.results_panel is not None:
+            self.results_panel.set_current_row(row)
+        self.on_open_vlc_clicked()
+
+    @Slot(int)
+    def _on_open_resolve_requested_from_panel(self, row: int) -> None:
+        if self.results_panel is not None:
+            self.results_panel.set_current_row(row)
+        self.on_open_in_resolve_clicked()
